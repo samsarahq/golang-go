@@ -1033,7 +1033,7 @@ func (db *DB) connectionResetter(ctx context.Context) {
 
 // Open one new connection
 func (db *DB) openNewConnection(ctx context.Context) {
-	// maybeOpenNewConnctions has already executed db.numOpen++ before it sent
+	// maybeOpenNewConnections has already executed db.numOpen++ before it sent
 	// on db.openerCh. This function must execute db.numOpen-- if the
 	// connection fails or is closed before returning.
 	ci, err := db.connector.Connect(ctx)
@@ -1048,7 +1048,7 @@ func (db *DB) openNewConnection(ctx context.Context) {
 	}
 	if err != nil {
 		db.numOpen--
-		db.putConnDBLocked(nil, err)
+		db.putConnDBLocked(nil, err, true)
 		db.maybeOpenNewConnections()
 		return
 	}
@@ -1057,7 +1057,7 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		createdAt: nowFunc(),
 		ci:        ci,
 	}
-	if db.putConnDBLocked(dc, err) {
+	if db.putConnDBLocked(dc, err, true) {
 		db.addDepLocked(dc, dc)
 	} else {
 		db.numOpen--
@@ -1329,7 +1329,7 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 			dc.Lock()
 		}
 	}
-	added := db.putConnDBLocked(dc, nil)
+	added := db.putConnDBLocked(dc, nil, !resetSession)
 	db.mu.Unlock()
 
 	if !added {
@@ -1354,21 +1354,21 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 
 // Satisfy a connRequest or put the driverConn in the idle pool and return true
 // or return false.
-// putConnDBLocked will satisfy a connRequest if there is one, or it will
-// return the *driverConn to the freeConnCh if err == nil and the idle
-// connection limit will not be exceeded.
+// putConnDBLocked will satisfy a connRequest from a clean session if there is
+// one, or it will return the *driverConn to the freeConnCh if err == nil and
+// the idle connection limit will not be exceeded.
 // If err != nil, the value of dc is ignored.
 // If err == nil, then dc must not equal nil.
 // If a connRequest was fulfilled or the *driverConn was placed in the
 // freeConnCh, then true is returned, otherwise false is returned.
-func (db *DB) putConnDBLocked(dc *driverConn, err error) bool {
+func (db *DB) putConnDBLocked(dc *driverConn, err error, cleanSession bool) bool {
 	if db.closed {
 		return false
 	}
 	if db.maxOpen > 0 && db.numOpen > db.maxOpen {
 		return false
 	}
-	if c := len(db.connRequests); c > 0 {
+	if c := len(db.connRequests); c > 0 && cleanSession {
 		var req chan connRequest
 		var reqKey uint64
 		for reqKey, req = range db.connRequests {
