@@ -1154,56 +1154,59 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 			return nil, ctx.Err()
 		case fc, fcok := <- db.freeConnCh:
 			fc.inUse = true
-			if strategy == cachedOrNewConn {
-				// Remove the connection request and if we received an extra
-				// connection, put it back before proceeding.
-				db.mu.Lock()
-				delete(db.connRequests, reqKey)
-				db.mu.Unlock()
+			// Remove the connection request and check if we received an extra
+			// connection from the request
+			db.mu.Lock()
+			delete(db.connRequests, reqKey)
+			db.mu.Unlock()
 
-				ok = fcok
-				ret = connRequest{conn: fc, err: nil}
-
-				select {
-				default:
-				case extraRet, extraOk := <- req:
-					if extraOk && extraRet.conn != nil {
-						db.putConn(extraRet.conn, extraRet.err, false)
+			select {
+			case ret, ok = <- req:
+				// Handle the extra connection
+				if strategy == cachedOrNewConn {
+					// Return the new connection and use the cached connection
+					db.putConn(ret.conn, ret.err, false)
+					ok = fcok
+					ret = connRequest{conn: fc, err: nil}
+				} else {
+					// Return the cached connection and use the new connection
+					db.putConn(fc, nil, true)
+				}
+			default:
+				// No extra connection, use or replace the cached connection
+				if strategy == cachedOrNewConn {
+					// Use the cached connection
+					ok = fcok
+					ret = connRequest{conn: fc, err: nil}
+				} else {
+					// Close the cached connection and create a new one
+					fc.Close()
+					if !fcok {
+						return nil, errDBClosed
 					}
-				}
-			} else {
-				// New free connection but only accepting new connections,
-				// close and create a new one
-				db.mu.Lock()
-				delete(db.connRequests, reqKey)
-				db.mu.Unlock()
 
-				fc.Close()
-				if !fcok {
-					return nil, errDBClosed
-				}
-
-				// Try to open a new connection
-				db.mu.Lock()
-				db.numOpen++ // optimistically
-				db.mu.Unlock()
-				ci, err := db.connector.Connect(ctx)
-				if err != nil {
+					// Try to open a new connection
 					db.mu.Lock()
-					db.numOpen-- // correct for earlier optimism
+					db.numOpen++ // optimistically
 					db.mu.Unlock()
+					ci, err := db.connector.Connect(ctx)
+					if err != nil {
+						db.mu.Lock()
+						db.numOpen-- // correct for earlier optimism
+						db.mu.Unlock()
+					}
+					db.mu.Lock()
+					dc := &driverConn{
+						db:        db,
+						createdAt: nowFunc(),
+						ci:        ci,
+						inUse:     true,
+					}
+					db.addDepLocked(dc, dc)
+					db.mu.Unlock()
+					ok = true
+					ret = connRequest{conn: dc, err: err}
 				}
-				db.mu.Lock()
-				dc := &driverConn{
-					db:        db,
-					createdAt: nowFunc(),
-					ci:        ci,
-					inUse:     true,
-				}
-				db.addDepLocked(dc, dc)
-				db.mu.Unlock()
-				return dc, err
-
 			}
 		case ret, ok = <-req:
 			// new connection available
