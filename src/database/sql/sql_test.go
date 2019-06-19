@@ -38,8 +38,8 @@ func init() {
 	}
 	putConnHook = func(db *DB, c *driverConn) {
 		idx := -1
-		for i := 0; i < len(db.freeConnCh); i ++ {
-			v := <- db.freeConnCh
+		for i := 0; i < len(db.freeConnCh); i++ {
+			v := <-db.freeConnCh
 			db.freeConnCh <- v
 			if v == c {
 				idx = i
@@ -152,7 +152,7 @@ func closeDB(t testing.TB, db *DB) {
 	})
 	db.mu.Lock()
 	for i := 1; i < len(db.freeConnCh); i++ {
-		dc := <- db.freeConnCh
+		dc := <-db.freeConnCh
 		db.freeConnCh <- dc
 		if n := len(dc.openStmt); n > 0 {
 			// Just a sanity check. This is legal in
@@ -181,13 +181,13 @@ func closeDB(t testing.TB, db *DB) {
 
 // freeFakeConn assumes that db has exactly 1 idle conn and returns
 // its fakeConn while also leaving it in the db.freeConnCh
-func freeFakeConn(t * testing.T, db *DB) *fakeConn {
+func freeFakeConn(t *testing.T, db *DB) *fakeConn {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if n := len(db.freeConnCh); n != 1 {
 		t.Fatalf("free conns = %d; want 1", n)
 	}
-	conn := <- db.freeConnCh
+	conn := <-db.freeConnCh
 	db.freeConnCh <- conn
 	return conn.ci.(*fakeConn)
 }
@@ -2191,8 +2191,8 @@ func TestConnMaxLifetime(t *testing.T) {
 }
 
 func TestPutConnExpiredOrBadReset(t *testing.T) {
-	execCases := []struct{
-		expired bool
+	execCases := []struct {
+		expired  bool
 		badReset bool
 	}{
 		{false, false},
@@ -2204,7 +2204,7 @@ func TestPutConnExpiredOrBadReset(t *testing.T) {
 	offset := time.Duration(0)
 
 	nowFunc = func() time.Time { return t0.Add(offset) }
-	defer func() { nowFunc = time.Now}()
+	defer func() { nowFunc = time.Now }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2240,7 +2240,8 @@ func TestPutConnExpiredOrBadReset(t *testing.T) {
 			}()
 
 			// Wait for pending request
-			for len(db.connRequests) < 1 {}
+			for len(db.connRequests) < 1 {
+			}
 
 			if ec.expired {
 				offset = 11 * time.Second
@@ -2256,7 +2257,6 @@ func TestPutConnExpiredOrBadReset(t *testing.T) {
 		})
 	}
 }
-
 
 // golang.org/issue/5323
 func TestStmtCloseDeps(t *testing.T) {
@@ -2378,7 +2378,7 @@ func TestCloseConnBeforeStmts(t *testing.T) {
 	if got := db.numFreeConns(); got != 1 {
 		t.Fatalf("expected 1 freeConn; got %d", got)
 	}
-	dc := <- db.freeConnCh
+	dc := <-db.freeConnCh
 	db.freeConnCh <- dc
 	if dc.closed {
 		t.Errorf("conn shouldn't be closed")
@@ -2505,7 +2505,7 @@ func TestManyErrBadConn(t *testing.T) {
 			t.Fatalf("unexpected len(db.freeConn) %d (was expecting %d)", len(db.freeConnCh), nconn)
 		}
 		for i := 0; i < len(db.freeConnCh); i++ {
-			conn := <- db.freeConnCh
+			conn := <-db.freeConnCh
 			conn.Lock()
 			db.freeConnCh <- conn
 			conn.ci.(*fakeConn).stickyBad = true

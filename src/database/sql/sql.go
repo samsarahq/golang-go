@@ -768,7 +768,7 @@ func (db *DB) Close() error {
 	var err error
 	fns := make([]func() error, 0, len(db.freeConnCh))
 	for len(db.freeConnCh) > 0 {
-		dc := <- db.freeConnCh
+		dc := <-db.freeConnCh
 		fns = append(fns, dc.closeDBLocked())
 	}
 	db.freeConnCh = nil
@@ -825,13 +825,13 @@ func (db *DB) SetMaxIdleConns(n int) {
 		db.maxIdle = db.maxOpen
 	}
 	var closing []*driverConn
-	var newFreeConnCh chan* driverConn
+	var newFreeConnCh chan *driverConn
 	maxIdle := db.maxIdleConnsLocked()
 	if maxIdle > 0 {
-		newFreeConnCh = make(chan* driverConn, maxIdle)
+		newFreeConnCh = make(chan *driverConn, maxIdle)
 	}
 	for len(db.freeConnCh) > 0 {
-		dc := <- db.freeConnCh
+		dc := <-db.freeConnCh
 		if len(newFreeConnCh) < maxIdle {
 			newFreeConnCh <- dc
 		} else {
@@ -922,7 +922,7 @@ func (db *DB) connectionCleaner(d time.Duration) {
 		var closing []*driverConn
 		freeConnLen := len(db.freeConnCh)
 		for i := 0; i < freeConnLen; i++ {
-			c := <- db.freeConnCh
+			c := <-db.freeConnCh
 			if c.expired(d) {
 				closing = append(closing, c)
 			} else {
@@ -1101,7 +1101,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 
 	// Prefer a free connection, if already present
 	if strategy == cachedOrNewConn && len(db.freeConnCh) > 0 {
-		conn := <- db.freeConnCh
+		conn := <-db.freeConnCh
 		conn.inUse = true
 		db.mu.Unlock()
 		if conn.expired(lifetime) {
@@ -1135,7 +1135,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		var ret connRequest
 		var ok bool
 		select {
-		case <- ctx.Done():
+		case <-ctx.Done():
 			// Remove the connection request and ensure no value has been sent
 			// on it after removing.
 			db.mu.Lock()
@@ -1152,7 +1152,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 				}
 			}
 			return nil, ctx.Err()
-		case fc, fcok := <- db.freeConnCh:
+		case fc, fcok := <-db.freeConnCh:
 			fc.inUse = true
 			// Remove the connection request and check if we received an extra
 			// connection from the request
@@ -1161,7 +1161,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 			db.mu.Unlock()
 
 			select {
-			case ret, ok = <- req:
+			case ret, ok = <-req:
 				// Handle the extra connection
 				if strategy == cachedOrNewConn {
 					// Return the new connection and use the cached connection
@@ -1233,7 +1233,6 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		}
 		return ret.conn, ret.err
 	}
-
 
 	// Try to open a new connection
 	db.numOpen++ // optimistically
