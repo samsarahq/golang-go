@@ -358,7 +358,7 @@ type DB struct {
 	numClosed uint64
 
 	mu           sync.Mutex // protects following fields
-	freeConn     []*driverConn
+	freeConnCh   chan *driverConn
 	connRequests map[uint64]chan connRequest
 	nextRequest  uint64 // Next key to use in connRequests.
 	numOpen      int    // number of opened and pending open connections
@@ -661,6 +661,7 @@ func OpenDB(c driver.Connector) *DB {
 	ctx, cancel := context.WithCancel(context.Background())
 	db := &DB{
 		connector:    c,
+		freeConnCh:   make(chan *driverConn, defaultMaxIdleConns),
 		openerCh:     make(chan struct{}, connectionRequestQueueSize),
 		resetterCh:   make(chan *driverConn, 50),
 		lastPut:      make(map[*driverConn]string),
@@ -765,11 +766,12 @@ func (db *DB) Close() error {
 		close(db.cleanerCh)
 	}
 	var err error
-	fns := make([]func() error, 0, len(db.freeConn))
-	for _, dc := range db.freeConn {
+	fns := make([]func() error, 0, len(db.freeConnCh))
+	for len(db.freeConnCh) > 0 {
+		dc := <-db.freeConnCh
 		fns = append(fns, dc.closeDBLocked())
 	}
-	db.freeConn = nil
+	db.freeConnCh = nil
 	db.closed = true
 	for _, req := range db.connRequests {
 		close(req)
@@ -823,12 +825,20 @@ func (db *DB) SetMaxIdleConns(n int) {
 		db.maxIdle = db.maxOpen
 	}
 	var closing []*driverConn
-	idleCount := len(db.freeConn)
+	var newFreeConnCh chan *driverConn
 	maxIdle := db.maxIdleConnsLocked()
-	if idleCount > maxIdle {
-		closing = db.freeConn[maxIdle:]
-		db.freeConn = db.freeConn[:maxIdle]
+	if maxIdle > 0 {
+		newFreeConnCh = make(chan *driverConn, maxIdle)
 	}
+	for len(db.freeConnCh) > 0 {
+		dc := <-db.freeConnCh
+		if len(newFreeConnCh) < maxIdle {
+			newFreeConnCh <- dc
+		} else {
+			closing = append(closing, dc)
+		}
+	}
+	db.freeConnCh = newFreeConnCh
 	db.maxIdleClosed += int64(len(closing))
 	db.mu.Unlock()
 	for _, c := range closing {
@@ -909,17 +919,14 @@ func (db *DB) connectionCleaner(d time.Duration) {
 			return
 		}
 
-		expiredSince := nowFunc().Add(-d)
 		var closing []*driverConn
-		for i := 0; i < len(db.freeConn); i++ {
-			c := db.freeConn[i]
-			if c.createdAt.Before(expiredSince) {
+		freeConnLen := len(db.freeConnCh)
+		for i := 0; i < freeConnLen; i++ {
+			c := <-db.freeConnCh
+			if c.expired(d) {
 				closing = append(closing, c)
-				last := len(db.freeConn) - 1
-				db.freeConn[i] = db.freeConn[last]
-				db.freeConn[last] = nil
-				db.freeConn = db.freeConn[:last]
-				i--
+			} else {
+				db.freeConnCh <- c
 			}
 		}
 		db.maxLifetimeClosed += int64(len(closing))
@@ -962,9 +969,9 @@ func (db *DB) Stats() DBStats {
 	stats := DBStats{
 		MaxOpenConnections: db.maxOpen,
 
-		Idle:            len(db.freeConn),
+		Idle:            len(db.freeConnCh),
 		OpenConnections: db.numOpen,
-		InUse:           db.numOpen - len(db.freeConn),
+		InUse:           db.numOpen - len(db.freeConnCh),
 
 		WaitCount:         db.waitCount,
 		WaitDuration:      time.Duration(wait),
@@ -1026,7 +1033,7 @@ func (db *DB) connectionResetter(ctx context.Context) {
 
 // Open one new connection
 func (db *DB) openNewConnection(ctx context.Context) {
-	// maybeOpenNewConnctions has already executed db.numOpen++ before it sent
+	// maybeOpenNewConnections has already executed db.numOpen++ before it sent
 	// on db.openerCh. This function must execute db.numOpen-- if the
 	// connection fails or is closed before returning.
 	ci, err := db.connector.Connect(ctx)
@@ -1041,7 +1048,7 @@ func (db *DB) openNewConnection(ctx context.Context) {
 	}
 	if err != nil {
 		db.numOpen--
-		db.putConnDBLocked(nil, err)
+		db.putConnDBLocked(nil, err, true)
 		db.maybeOpenNewConnections()
 		return
 	}
@@ -1050,7 +1057,7 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		createdAt: nowFunc(),
 		ci:        ci,
 	}
-	if db.putConnDBLocked(dc, err) {
+	if db.putConnDBLocked(dc, err, true) {
 		db.addDepLocked(dc, dc)
 	} else {
 		db.numOpen--
@@ -1092,18 +1099,16 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 	}
 	lifetime := db.maxLifetime
 
-	// Prefer a free connection, if possible.
-	numFree := len(db.freeConn)
-	if strategy == cachedOrNewConn && numFree > 0 {
-		conn := db.freeConn[0]
-		copy(db.freeConn, db.freeConn[1:])
-		db.freeConn = db.freeConn[:numFree-1]
+	// Prefer a free connection, if already present
+	if strategy == cachedOrNewConn && len(db.freeConnCh) > 0 {
+		conn := <-db.freeConnCh
 		conn.inUse = true
 		db.mu.Unlock()
 		if conn.expired(lifetime) {
 			conn.Close()
 			return nil, driver.ErrBadConn
 		}
+
 		// Lock around reading lastErr to ensure the session resetter finished.
 		conn.Lock()
 		err := conn.lastErr
@@ -1115,8 +1120,7 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		return conn, nil
 	}
 
-	// Out of free connections or we were asked not to use one. If we're not
-	// allowed to open any more connections, make a request and wait.
+	// If we cannot open a new connection, wait until one is available
 	if db.maxOpen > 0 && db.numOpen >= db.maxOpen {
 		// Make the connRequest channel. It's buffered so that the
 		// connectionOpener doesn't block while waiting for the req to be read.
@@ -1128,7 +1132,8 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 
 		waitStart := time.Now()
 
-		// Timeout the connection request with the context.
+		var ret connRequest
+		var ok bool
 		select {
 		case <-ctx.Done():
 			// Remove the connection request and ensure no value has been sent
@@ -1147,31 +1152,89 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 				}
 			}
 			return nil, ctx.Err()
-		case ret, ok := <-req:
-			atomic.AddInt64(&db.waitDuration, int64(time.Since(waitStart)))
+		case fc, fcok := <-db.freeConnCh:
+			fc.inUse = true
+			// Remove the connection request and check if we received an extra
+			// connection from the request
+			db.mu.Lock()
+			delete(db.connRequests, reqKey)
+			db.mu.Unlock()
 
-			if !ok {
-				return nil, errDBClosed
+			select {
+			case ret, ok = <-req:
+				// Handle the extra connection
+				if strategy == cachedOrNewConn {
+					// Return the new connection and use the cached connection
+					db.putConn(ret.conn, ret.err, false)
+					ok = fcok
+					ret = connRequest{conn: fc, err: nil}
+				} else {
+					// Return the cached connection and use the new connection
+					db.putConn(fc, nil, true)
+				}
+			default:
+				// No extra connection, use or replace the cached connection
+				if strategy == cachedOrNewConn {
+					// Use the cached connection
+					ok = fcok
+					ret = connRequest{conn: fc, err: nil}
+				} else {
+					// Close the cached connection and create a new one
+					fc.Close()
+					if !fcok {
+						return nil, errDBClosed
+					}
+
+					// Try to open a new connection
+					db.mu.Lock()
+					db.numOpen++ // optimistically
+					db.mu.Unlock()
+					ci, err := db.connector.Connect(ctx)
+					if err != nil {
+						db.mu.Lock()
+						db.numOpen-- // correct for earlier optimism
+						db.mu.Unlock()
+					}
+					db.mu.Lock()
+					dc := &driverConn{
+						db:        db,
+						createdAt: nowFunc(),
+						ci:        ci,
+						inUse:     true,
+					}
+					db.addDepLocked(dc, dc)
+					db.mu.Unlock()
+					ok = true
+					ret = connRequest{conn: dc, err: err}
+				}
 			}
-			if ret.err == nil && ret.conn.expired(lifetime) {
-				ret.conn.Close()
-				return nil, driver.ErrBadConn
-			}
-			if ret.conn == nil {
-				return nil, ret.err
-			}
-			// Lock around reading lastErr to ensure the session resetter finished.
-			ret.conn.Lock()
-			err := ret.conn.lastErr
-			ret.conn.Unlock()
-			if err == driver.ErrBadConn {
-				ret.conn.Close()
-				return nil, driver.ErrBadConn
-			}
-			return ret.conn, ret.err
+		case ret, ok = <-req:
+			// new connection available
 		}
+		atomic.AddInt64(&db.waitDuration, int64(time.Since(waitStart)))
+
+		if !ok {
+			return nil, errDBClosed
+		}
+		if ret.err == nil && ret.conn.expired(lifetime) {
+			ret.conn.Close()
+			return nil, driver.ErrBadConn
+		}
+		if ret.conn == nil {
+			return nil, ret.err
+		}
+		// Lock around reading lastErr to ensure the session resetter finished.
+		ret.conn.Lock()
+		err := ret.conn.lastErr
+		ret.conn.Unlock()
+		if err == driver.ErrBadConn {
+			ret.conn.Close()
+			return nil, driver.ErrBadConn
+		}
+		return ret.conn, ret.err
 	}
 
+	// Try to open a new connection
 	db.numOpen++ // optimistically
 	db.mu.Unlock()
 	ci, err := db.connector.Connect(ctx)
@@ -1268,7 +1331,7 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 			dc.Lock()
 		}
 	}
-	added := db.putConnDBLocked(dc, nil)
+	added := db.putConnDBLocked(dc, nil, !resetSession)
 	db.mu.Unlock()
 
 	if !added {
@@ -1293,21 +1356,21 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 
 // Satisfy a connRequest or put the driverConn in the idle pool and return true
 // or return false.
-// putConnDBLocked will satisfy a connRequest if there is one, or it will
-// return the *driverConn to the freeConn list if err == nil and the idle
-// connection limit will not be exceeded.
+// putConnDBLocked will satisfy a connRequest from a clean session if there is
+// one, or it will return the *driverConn to the freeConnCh if err == nil and
+// the idle connection limit will not be exceeded.
 // If err != nil, the value of dc is ignored.
 // If err == nil, then dc must not equal nil.
 // If a connRequest was fulfilled or the *driverConn was placed in the
-// freeConn list, then true is returned, otherwise false is returned.
-func (db *DB) putConnDBLocked(dc *driverConn, err error) bool {
+// freeConnCh, then true is returned, otherwise false is returned.
+func (db *DB) putConnDBLocked(dc *driverConn, err error, cleanSession bool) bool {
 	if db.closed {
 		return false
 	}
 	if db.maxOpen > 0 && db.numOpen > db.maxOpen {
 		return false
 	}
-	if c := len(db.connRequests); c > 0 {
+	if c := len(db.connRequests); c > 0 && cleanSession {
 		var req chan connRequest
 		var reqKey uint64
 		for reqKey, req = range db.connRequests {
@@ -1323,8 +1386,8 @@ func (db *DB) putConnDBLocked(dc *driverConn, err error) bool {
 		}
 		return true
 	} else if err == nil && !db.closed {
-		if db.maxIdleConnsLocked() > len(db.freeConn) {
-			db.freeConn = append(db.freeConn, dc)
+		if db.maxIdleConnsLocked() > len(db.freeConnCh) {
+			db.freeConnCh <- dc
 			db.startCleanerLocked()
 			return true
 		}
